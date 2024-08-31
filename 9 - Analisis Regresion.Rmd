@@ -1,0 +1,529 @@
+---
+title: "Modelo de Regresión para predecir el engagement de los posts"
+author: "Andrea Pérez"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message = FALSE}
+library(readxl)
+library(psych)
+library(dplyr)
+library(nortest)
+library(lmerTest)
+library(ggplot2)
+library(lattice)
+library(ggpubr)       
+library(moments)      
+library(sjPlot)
+library(car)          
+library(lmtest)       
+library(corrplot)
+library(descr)
+library(caret)
+library(knitr)
+library(gridExtra)
+library(performance)
+library(kableExtra)
+library(jtools)
+```
+
+
+# Cargar los datos 
+
+```{r}
+archivo <- "info_post_sin_texto_etiquetas_categorico.xlsx"
+hoja <- "Sheet1"
+datos_ <- read_excel(archivo, sheet = hoja)
+datos_ <- data.frame(datos_)
+print(nrow(datos_))
+```
+
+
+## Eliminar registros con valores negativos en *likes*
+
+Se han eliminado 840 registros porque contenían *likes* con valor -1.
+
+```{r}
+datos <- datos_[datos_$likes >= 0, ]
+print(nrow(datos))
+```
+
+
+## Manejar valores faltantes
+
+Los post que no tenían descripción se ha cambiado el valor de la variable "texto" en NA" por 0.
+
+```{r}
+filas_con_NA <- datos[!complete.cases(datos), ]
+print(nrow(filas_con_NA))
+```
+
+
+## Convertir columnas categóricas a factores
+
+```{r}
+columnas_categoricas <- c("archivo", "usuario", "post", "shortcode")
+datos[columnas_categoricas] <- lapply(datos[columnas_categoricas], as.factor)
+
+hora_orden <- c("mañana", "tarde", "noche")
+datos$hora <- factor(datos$hora, levels = hora_orden)
+
+dia_orden <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+datos$dia <- factor(datos$dia, levels = dia_orden)
+```
+
+
+## Estadísticas Descriptivas
+
+Se han eliminado del modelo las variables 'video' y 'carrusel'. Ya que todas las publicaciones son imágenes porque los posts con videos los descartamos y si indica que es un vídeo se debe a que es un reel y se descargaba la portada como archivo .jpg. Por otro lado, la variable 'carusel' indica si era un post con varias imágenes o solo 1. Está muy relacionada con la variable 'imágenes' por tanto solo hemos considerado esta última.
+
+```{r}
+x <- describe(select(datos, -archivo), ranges = TRUE, omit = TRUE) %>%
+select(-c(trimmed, mad, range, se))
+
+kable(x, digits = 3)
+```
+
+
+## Matriz de correlaciones
+
+```{r}
+lista_variables_continuas <- c('premios', 'num_post_año', 'diferencia_dias', 'likes',
+                               'comentarios', 'seguidores', 'imagenes', 'texto', 'hashtags')
+
+par(mar = c(1, 1, 1, 1))
+corrplot(cor(select(datos, all_of(lista_variables_continuas))), 
+         method = "color", 
+         type = "upper", 
+         order = "hclust", 
+         addCoef.col = "black", 
+         tl.col = "black", 
+         tl.srt = 45, 
+         tl.cex = 0.8, 
+         number.cex = 0.7)
+```
+
+
+## Transformación de variables
+
+```{r, results='asis'}
+for (variable in lista_variables_continuas){
+
+  variable.sqrt = paste0(variable, '.sqrt')
+  variable.log = paste0(variable, '.log')
+  
+  datos[[variable.sqrt]] <- sqrt(datos[[variable]])
+  if (any(grepl(0, datos[[variable]]))){
+    x <- datos[[variable]]
+    x <- replace(x, x==0, 1)
+    datos[[variable.log]] <- log(x)
+  } else {
+    datos[[variable.log]] <- log(datos[[variable]])
+  }
+  
+  p1 <- ggplot(datos, aes(x = eval(parse(text = variable)))) + 
+    geom_density() + 
+    stat_overlay_normal_density(color = "red", linetype = "dashed") + 
+    labs(title = "En Bruto", x = variable)
+  
+  p2 <- ggplot(datos, aes(x = eval(parse(text = variable.sqrt)))) + 
+    geom_density() + 
+    stat_overlay_normal_density(color = "red", linetype = "dashed") + 
+    labs(title = "Transformada: Raíz Cuadrada", x = variable.sqrt)
+  
+  p3 <- ggplot(datos, aes(x = eval(parse(text = variable.log)))) + 
+    geom_density() + 
+    stat_overlay_normal_density(color = "red", linetype = "dashed") + 
+    labs(title = "Transformada: Logaritmo", x = variable.log)
+  
+  grid.arrange(p1, p2, p3, ncol = 3)
+  
+  skew.raw <- skewness(datos[[variable]], na.rm = TRUE)
+  skew.sqrt <- skewness(datos[[variable.sqrt]], na.rm = TRUE)
+  skew.log <- skewness(datos[[variable.log]], na.rm = TRUE)
+  
+  df.resultados <- data.frame(
+    original.skewness = skew.raw,
+    raiz.skewness = skew.sqrt,
+    log.skewness = skew.log
+  )
+  
+  print(kable(df.resultados, 
+              caption = paste0('Resultados de los test de skewness para la variable ',
+                               variable, '.')))
+}
+```
+
+
+Con los resultados de cada variable según su distribución, nos vamos a quedar con todas las variables continuas considerando su logaritmo menos la variable diferencia_dias que la usaremos tal cual:
+
+- premios.log
+- num_post_año.log
+- diferencia_dias
+- likes.log
+- comentarios.log
+- seguidores.log
+- imagenes.log
+- texto.log
+- hashtag.log
+
+
+```{r}
+premios.log <- log(datos$premios)
+num_post_año.log <- log(datos$num_post_año)
+likes.log <- log(datos$likes)
+comentarios.log <- log(datos$comentarios)
+seguidores.log <- log(datos$seguidores)
+imagenes.log <- log(datos$imagenes)
+texto.log <- log(datos$texto)
+hashtags.log <- log(datos$hashtags)
+```
+
+
+# *Likes*
+
+
+## Distribución variables independientes
+
+```{r}
+par(mfrow = c(2, 2))
+
+boxplot(likes ~ premios, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ video, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ carrusel, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ imagenes, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ escenario, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ microfono, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ instrumento_percusion, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ instrumento_cuerda, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ instrumento_viento, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ mascota, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ hora, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+boxplot(likes ~ dia, col=c("white","lightgray","darkgray"), datos, main = 'likes', outline = FALSE)
+```
+
+
+## Modelo *likes* null
+
+```{r}
+modelo_likes_null <- lmer(likes.log ~ premios.log + num_post_año.log + diferencia_dias
+                      + seguidores.log + imagenes.log + texto.log 
+                     + hashtags.log + hora + dia + (1|usuario), data=datos, REML=FALSE)
+
+summ(modelo_likes_null, scale = TRUE, confint = TRUE)
+```
+
+
+## Modelo *likes* con imágenes
+
+
+```{r, warning=FALSE, message=FALSE}
+modelo_likes <- lmer(likes.log ~ premios.log + num_post_año.log + diferencia_dias
+                      + seguidores.log + imagenes.log + texto.log 
+                     + hashtags.log + escenario + microfono + instrumento_percusion 
+                     + instrumento_cuerda + instrumento_viento + mascota + hora + dia 
+                     + (1|usuario), data=datos, REML=FALSE)
+
+summ(modelo_likes, scale = TRUE, confint = TRUE)
+```
+
+
+### Outliers
+
+#### Grafico QQ normalidad de los residuos
+
+Como los puntos siguen estrechamente la línea diagonal, los residuos son aproximadamente normales. Sin embargo, al haber una curvatura significativa en el extremo superior, podríamos tener problemas con la normalidad de los residuos.
+
+```{r}
+# Gráfico QQ Normal
+qqPlot(resid(modelo_likes), main = 'Gráfico QQ inicial - Likes')
+```
+
+
+#### Modelo *likes* sin outliers
+
+
+Se detectan 10 registros atípicos.
+
+```{r}
+outliers <- outlierTest(modelo_likes)
+indices.outliers <- as.numeric(names(outliers$rstudent))
+
+registros_out <- datos[indices.outliers, ]
+print(nrow(registros_out))
+```
+
+
+```{r}
+modelo_likes_out <- lmer(likes.log ~ premios.log + num_post_año.log + diferencia_dias
+                      + seguidores.log + imagenes.log + texto.log 
+                     + hashtags.log + escenario + microfono + instrumento_percusion 
+                     + instrumento_cuerda + instrumento_viento + mascota + hora + dia
+                     + (1|usuario), data = datos[-indices.outliers, ], REML=FALSE)
+
+summ(modelo_likes_out, scale = TRUE, confint = TRUE)
+```
+
+
+#### Grafico QQ normalidad de los residuos
+
+```{r}
+qqPlot(resid(modelo_likes_out), main = 'Gráfico QQ inicial - Likes - Sin Outliers')
+```
+
+
+En cuanto a los predictores no se han visto diferencias significativas relevantes para el estudio, sin embargo, la eliminación de outliers ha mejorado ligeramente el modelo en términos de AIC, BIC, logLik, y desviación, así como en la reducción de los valores extremos de los residuales. La varianza residual ha disminuido un poco, indicando una mejora en la explicación de la variabilidad dentro de los usuarios. En general, el modelo ajustado sin outliers presenta un ligera mejoría en el ajuste y en la precisión de las estimaciones, sin embargo, al contar solo con 10 registros atípicos frente al número de registros de la muestra, nos quedaremos con el modelo con todos los datos.
+
+
+## Modelo interacciones (seguidores.log:imagenes.log)
+
+Se han probado las siguientes interacciones, sin embargo, solo se considera el modelo a continuación:
+
+- seguidores.log:imagenes.log: p-valor = 4.83e-11
+- diferencia_dias:imagenes.log: p-valor = 5.41e-06
+- premios.log:imagenes.log: p-valor = 0.000348
+- instrumento_cuerda:instrumento_viento: p-valor = 0.000827
+- imagenes.log:mascota: p-valor = 0.005607
+- premios.log:instrumento_cuerda: p-valor = 0.00734
+
+
+```{r}
+modelo_likes_int <- lmer(likes.log ~ premios.log + num_post_año.log + diferencia_dias
+                         + seguidores.log + imagenes.log + texto.log + hashtags.log 
+                         + escenario + microfono + instrumento_percusion 
+                         + instrumento_cuerda + instrumento_viento + mascota + hora 
+                         + dia + seguidores.log:imagenes.log + (1 | usuario),  
+                         data = datos, REML = FALSE)
+
+summ(modelo_likes_int, scale = TRUE, confint = TRUE)
+```
+
+
+## Medidas finales
+
+La comparación sugiere que el modelo que tiene en cuenta la información de la imagen (modelo_likes) proporciona un mejor ajuste a los datos frente al modelo sin descriptivo de la imagen (modelo_likes_null), ya que tiene una deviance menor y un log-likelihood más alto. Además, el AIC apoya la superioridad de modelo_likes dado que es más bajo que el del modelo_likes_null, aunque el BIC, que tiende a penalizar los modelos complejos, es más alto para el modelo_likes.
+
+El p-valor es muy bajo, lo que indica que la mejora en el ajuste al añadir las características de la imagen es estadísticamente significativa.
+
+```{r message=FALSE, warning=FALSE}
+kable(AIC(modelo_likes_null, modelo_likes, modelo_likes_int))
+kable(BIC(modelo_likes_null, modelo_likes, modelo_likes_int))
+
+plot(modelo_likes_int)
+qqnorm(resid(modelo_likes_int))
+qqline(resid(modelo_likes_int))
+```
+
+```{r}
+kable(anova(modelo_likes_null, modelo_likes), format = "markdown", 
+      caption = "ANOVA entre ambos modelos")
+```
+
+```{r}
+kable(anova(modelo_likes, modelo_likes_int), format = "markdown", 
+      caption = "ANOVA entre ambos modelos")
+```
+
+
+A continuación, comentamos el desempeño de los modelos según algunas métricas.
+
+En este caso, un valor R² (cond.), indica que el modelo explica el 90.3% de la variabilidad en los datos.
+Un R² marginal alto, muestra que los efectos fijos por sí solos explican el 82.9% de la variabilidad en la variable dependiente.
+El ICC indica que el 43.3% de la variabilidad en los datos se debe a las diferencias entre usuarios, mientras que el resto de la variabilidad se debe a diferencias dentro de cada usuario.
+Un RMSE alto, indica que el modelo tiene una mayor desviación de las predicciones con respecto a los valores observados.
+
+Así que, siendo nuestro objetivo encontrar un modelo que proporcione el mejor ajuste general y que pueda explicar nuestros datos, elegimos el _modelo que tiene en cuenta la interacción_.
+
+
+```{r message=FALSE, warning=FALSE}
+model_performance_likes_int <- performance(modelo_likes_int)
+kable(model_performance_likes_int)
+```
+
+```{r message=FALSE, warning=FALSE}
+model_performance_likes <- performance(modelo_likes)
+kable(model_performance_likes)
+```
+
+```{r message=FALSE, warning=FALSE}
+model_performance_likes_null <- performance(modelo_likes_null)
+kable(model_performance_likes_null)
+```
+
+
+# Comentarios
+
+
+## Distribución variables independientes
+
+```{r}
+par(mfrow = c(2, 2))
+
+boxplot(comentarios ~ premios, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ video, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ carrusel, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ imagenes, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ escenario, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ microfono, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ instrumento_percusion, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ instrumento_cuerda, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ instrumento_viento, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ mascota, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ hora, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+boxplot(comentarios ~ dia, col=c("white","lightgray","darkgray"), datos, main = 'comentarios', outline = FALSE)
+```
+
+
+## Modelo comentarios null
+
+```{r}
+modelo_comentarios_null <- lmer(comentarios.log ~ premios.log + num_post_año.log 
+                           + diferencia_dias + seguidores.log + imagenes.log 
+                           + texto.log + hashtags.log + hora + dia + (1|usuario),
+                           data=datos, REML=FALSE)
+
+summ(modelo_comentarios_null, scale = TRUE, confint = TRUE)
+```
+
+
+## Modelo comentarios con imágenes
+
+```{r}
+modelo_comentarios <- lmer(comentarios.log ~ premios.log + num_post_año.log 
+                           + diferencia_dias + seguidores.log + imagenes.log 
+                           + texto.log + hashtags.log + escenario + microfono 
+                           + instrumento_percusion + instrumento_cuerda 
+                           + instrumento_viento + mascota + hora + dia
+                           + (1|usuario), data=datos, REML=FALSE)
+
+summ(modelo_comentarios, scale = TRUE, confint = TRUE)
+```
+
+
+### Outliers
+
+#### Grafico QQ normalidad de los residuos
+
+
+Como los puntos siguen estrechamente la línea diagonal, los residuos son aproximadamente normales. Sin embargo, al haber una curvatura significativa en los extremos, podríamos tener problemas con la normalidad de los residuos.
+
+```{r}
+qqPlot(resid(modelo_comentarios), main = 'Gráfico QQ inicial - Comentarios')
+```
+
+
+#### Modelo comentarios sin outliers
+
+
+Se detectan los registros atípicos para la variable de los comentarios.
+
+```{r}
+outliers <- outlierTest(modelo_comentarios)
+indices.outliers <- as.numeric(names(outliers$rstudent))
+
+registros_out <- datos[indices.outliers, ]
+print(nrow(registros_out))
+```
+
+
+```{r}
+modelo_comentarios_out <- lmer(comentarios.log ~ premios.log + num_post_año.log 
+                           + diferencia_dias + seguidores.log + imagenes.log 
+                           + texto.log + hashtags.log + escenario + microfono 
+                           + instrumento_percusion + instrumento_cuerda 
+                           + instrumento_viento + mascota + hora + dia
+                           + (1|usuario), data = datos[-indices.outliers,], REML=FALSE)
+
+summ(modelo_comentarios_out, scale = TRUE, confint = TRUE)
+```
+
+
+En cuanto a los predictores no se han visto diferencias significativas relevantes para el estudio, sin embargo, la eliminación de outliers ha mejorado ligeramente el modelo en términos de AIC, BIC, logLik, y desviación, así como en la reducción de los valores extremos de los residuales. La varianza residual ha disminuido un poco, indicando una mejora en la explicación de la variabilidad dentro de los usuarios. En general, el modelo ajustado sin outliers presenta un mejor ajuste y una ligera mejora en la precisión de las estimaciones, sin embargo, al contar solo con 10 registros atípicos frente al número de registros de la muestra, nos quedaremos con el modelo con todos los datos.
+
+
+#### Grafico QQ normalidad de los residuos
+
+
+Se puede observar un gráfico con una pendiente más suavizada.
+
+```{r}
+qqPlot(resid(modelo_comentarios), main = 'Gráfico QQ inicial - Comentarios - Sin Outliers')
+```
+
+
+## Modelo interaciones (imagenes.log:escenario)
+
+Se han probado las siguientes interacciones, sin embargo, solo se considera el modelo a continuación:
+
+- imagenes.log:escenario: p-valor = 1.71e-10 *** 
+- premios.log:hashtags.log: p-valor = 3.29e-08 ***
+- imagenes.log:microfono: p-valor = 1.23e-05 ***
+- num_post_año.log:texto.log: p-valor = 0.000112 ***
+- premios.log:imagenes.log: p-valor = 0.008150 ** 
+- premios.log:microfono: p-valor = 0.010231 *
+
+```{r}
+modelo_comentarios_int <- lmer(comentarios.log ~ premios.log + num_post_año.log 
+                               + diferencia_dias + seguidores.log + imagenes.log 
+                               + texto.log + hashtags.log + escenario + microfono 
+                               + instrumento_percusion + instrumento_cuerda 
+                               + instrumento_viento + mascota + hora + dia
+                               + imagenes.log:escenario
+                               + (1 | usuario), data = datos, REML = FALSE)
+
+summ(modelo_comentarios_int, scale = TRUE, confint = TRUE)
+```
+
+
+## Medidas finales
+
+Comparamos los 3 modelos y visualizamos los residuos del elegido.
+
+```{r message=FALSE, warning=FALSE}
+kable(AIC(modelo_comentarios_null, modelo_comentarios, modelo_comentarios_int))
+kable(BIC(modelo_comentarios_null, modelo_comentarios, modelo_comentarios_int))
+
+plot(modelo_comentarios_int)
+qqnorm(resid(modelo_comentarios_int))
+qqline(resid(modelo_comentarios_int))
+```
+
+
+```{r}
+kable(anova(modelo_comentarios_null, modelo_comentarios), format = "markdown", 
+      caption = "ANOVA entre ambos modelos")
+```
+
+```{r}
+kable(anova(modelo_comentarios, modelo_comentarios_int), format = "markdown", 
+      caption = "ANOVA entre ambos modelos")
+```
+
+
+En este caso, un valor R² (cond.), indica que el modelo explica el 79.9% de la variabilidad en los datos.
+Un R² marginal alto, muestra que los efectos fijos por sí solos explican el 58.3% de la variabilidad en la variable dependiente.
+El ICC indica que el 51.7% de la variabilidad en los datos se debe a las diferencias entre usuarios, mientras que el resto de la variabilidad se debe a diferencias dentro de cada usuario.
+Un RMSE alto, indica que el modelo tiene una mayor desviación de las predicciones con respecto a los valores observados.
+
+Así que, siendo nuestro objetivo encontrar un modelo que proporcione el mejor ajuste general y que pueda explicar nuestros datos, elegimos el _modelo que tiene en cuenta la interacción_.
+
+```{r message=FALSE, warning=FALSE}
+model_performance_comentarios_int <- performance(modelo_comentarios_int)
+kable(model_performance_comentarios_int)
+```
+
+```{r message=FALSE, warning=FALSE}
+model_performance_comentarios <- performance(modelo_comentarios)
+kable(model_performance_comentarios)
+```
+
+```{r message=FALSE, warning=FALSE}
+model_performance_comentarios_null <- performance(modelo_comentarios_null)
+kable(model_performance_comentarios_null)
+```
+
